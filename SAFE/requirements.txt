@@ -1,10 +1,8 @@
-google-genai
-python-dotenv
-sounddevice
-soundfile
-numpy
-pyttsx3
-pandas
-rapidfuzz
-uvicorn
 fastapi
+uvicorn
+pandas
+python-dotenv
+rapidfuzz
+gtts
+google-genai
+

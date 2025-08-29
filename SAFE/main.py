@@ -2,16 +2,18 @@
 """
 🎙️ Gemini Voice Assistant (CSV Q&A + Options Selection)
 Web-safe version: no sounddevice, no pyttsx3
-Frontend handles recording/playback, backend handles:
+Frontend handles recording/playback.
+Backend handles:
 - CSV lookup
 - Gemini fallback
-- gTTS for audio response
+- gTTS for audio response (returned as Base64)
 """
 
 import os
 import sys
 import re
 import tempfile
+import base64
 import pandas as pd
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
@@ -123,20 +125,21 @@ def root():
 
 @app.post("/ask/")
 async def ask(query: str = Form(...)):
-    """Handle text query, return text + speech file"""
+    """Handle text query, return text + speech (Base64)"""
     local_answer = find_answer_local(query, qa_pairs)
     if local_answer:
         answer = local_answer
     else:
         answer = query_gemini(query)
 
-    # Generate speech
+    # Generate speech as Base64
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
         tts = gTTS(answer)
         tts.save(tmpfile.name)
-        audio_path = tmpfile.name
+        with open(tmpfile.name, "rb") as f:
+            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-    return {"answer": answer, "audio_file": audio_path}
+    return {"answer": answer, "audio_base64": audio_base64}
 
 @app.post("/stt/")
 async def stt(file: UploadFile):

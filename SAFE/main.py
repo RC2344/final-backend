@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-🎙️ Gemini Voice Assistant (CSV Q&A + Options Selection)
-Professional version for Render deployment
-- CSV lookup
-- Gemini fallback
-- gTTS for speech (Base64)
-- Logs conversation history
+🎙️ Professional Voice-to-Voice Agent
+Flow:
+- Start → greet + ready
+- Mic → record speech
+- Stop → transcribe + get answer (CSV or Gemini)
+- Respond with text + voice
 """
 
 import os
@@ -18,7 +18,6 @@ from rapidfuzz import fuzz
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from gtts import gTTS
-from typing import List
 
 from google import genai
 from google.genai import types
@@ -37,7 +36,6 @@ SYS_PROMPT_QA = (
     "You are a clear, friendly voice assistant. "
     "Always explain things in short, simple sentences. "
     "Make it sound natural, as if spoken to a beginner. "
-    "Do not just read. Rephrase to sound human."
 )
 
 CSV_FILE = "qa.csv"
@@ -51,14 +49,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------- Logs ----------------
-conversation_logs: List[str] = ["System initialized ✅"]
-
-def log_event(entry: str):
-    conversation_logs.append(entry)
-    if len(conversation_logs) > 50:  # keep memory small
-        conversation_logs.pop(0)
 
 # ---------------- CSV Loader ----------------
 def load_csv(csv_file):
@@ -79,8 +69,7 @@ def score_match(user_text: str, candidate: str) -> float:
     return (0.4 * tsr + 0.3 * pr + 0.2 * wr + 0.1 * len_score)
 
 def find_answer_local(user_text: str, qa_pairs: list, top_k: int = 5):
-    user_text = user_text.strip()
-    if not user_text:
+    if not user_text.strip():
         return None
     candidates = [(q, score_match(user_text, q), idx) for idx, (q, _) in enumerate(qa_pairs)]
     candidates = sorted(candidates, key=lambda x: x[1], reverse=True)[:top_k]
@@ -125,50 +114,44 @@ def transcribe_audio(file_path: str) -> str:
     except Exception as e:
         return f"⚠️ STT error: {e}"
 
+# ---------------- Utils ----------------
+def synthesize_speech(text: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
+        tts = gTTS(text)
+        tts.save(tmpfile.name)
+        with open(tmpfile.name, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
 # ---------------- API Endpoints ----------------
 @app.get("/")
 def root():
     return {"status": "Voice Assistant Backend is running"}
 
-@app.post("/ask/")
-async def ask(query: str = Form(...)):
-    """Handle text query, return text + speech (Base64)"""
-    log_event(f"🧑 User: {query}")
-    local_answer = find_answer_local(query, qa_pairs)
-    if local_answer:
-        answer = local_answer
-    else:
-        answer = query_gemini(query)
-    log_event(f"🤖 Bot: {answer}")
-
-    # Generate speech as Base64
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
-        tts = gTTS(answer)
-        tts.save(tmpfile.name)
-        with open(tmpfile.name, "rb") as f:
-            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-    return {"answer": answer, "audio_base64": audio_base64}
+@app.post("/start")
+async def start():
+    greeting = "Hello 👋 I'm ready to help. Please ask me anything!"
+    audio_b64 = synthesize_speech(greeting)
+    return {"status": "started", "answer": greeting, "audio_base64": audio_b64}
 
 @app.post("/stt/")
 async def stt(file: UploadFile):
-    """Accept audio file, return transcription"""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
         tmpfile.write(await file.read())
         tmpfile_path = tmpfile.name
     text = transcribe_audio(tmpfile_path)
-    log_event(f"🎤 Transcribed: {text}")
     return {"transcription": text}
 
-@app.get("/status")
-async def status():
-    return {"status": "ok", "message": "Backend alive ✅"}
+@app.post("/ask/")
+async def ask(query: str = Form(...)):
+    local_answer = find_answer_local(query, qa_pairs)
+    answer = local_answer if local_answer else query_gemini(query)
+    audio_b64 = synthesize_speech(answer)
+    return {"answer": answer, "audio_base64": audio_b64}
 
-@app.get("/logs")
-async def logs():
-    return {"logs": conversation_logs}
+@app.post("/stop")
+async def stop():
+    return {"status": "stopped", "message": "Stopped listening."}
 
-@app.post("/start")
-async def start():
-    log_event("🚀 Session started")
-    return {"status": "started", "message": "Backend process started ✅"}
+@app.post("/quit")
+async def quit():
+    return {"status": "quit", "message": "Agent terminated."}

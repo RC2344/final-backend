@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 🎙️ Gemini Voice Assistant (CSV Q&A + Options Selection)
-Web-safe version: no sounddevice, no pyttsx3
-Frontend handles recording/playback.
-Backend handles:
+Professional version for Render deployment
 - CSV lookup
 - Gemini fallback
-- gTTS for audio response (returned as Base64)
+- gTTS for speech (Base64)
+- Logs conversation history
 """
 
 import os
 import sys
-import re
 import tempfile
 import base64
 import pandas as pd
@@ -20,6 +18,7 @@ from rapidfuzz import fuzz
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from gtts import gTTS
+from typing import List
 
 from google import genai
 from google.genai import types
@@ -52,6 +51,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------- Logs ----------------
+conversation_logs: List[str] = ["System initialized ✅"]
+
+def log_event(entry: str):
+    conversation_logs.append(entry)
+    if len(conversation_logs) > 50:  # keep memory small
+        conversation_logs.pop(0)
 
 # ---------------- CSV Loader ----------------
 def load_csv(csv_file):
@@ -126,11 +133,13 @@ def root():
 @app.post("/ask/")
 async def ask(query: str = Form(...)):
     """Handle text query, return text + speech (Base64)"""
+    log_event(f"🧑 User: {query}")
     local_answer = find_answer_local(query, qa_pairs)
     if local_answer:
         answer = local_answer
     else:
         answer = query_gemini(query)
+    log_event(f"🤖 Bot: {answer}")
 
     # Generate speech as Base64
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
@@ -148,17 +157,18 @@ async def stt(file: UploadFile):
         tmpfile.write(await file.read())
         tmpfile_path = tmpfile.name
     text = transcribe_audio(tmpfile_path)
+    log_event(f"🎤 Transcribed: {text}")
     return {"transcription": text}
 
-# ---------------- Dummy Endpoints (for frontend compatibility) ----------------
 @app.get("/status")
 async def status():
-    return {"status": "ok", "message": "Backend is alive ✅"}
+    return {"status": "ok", "message": "Backend alive ✅"}
 
 @app.get("/logs")
 async def logs():
-    return {"logs": ["System initialized", "No errors so far 🚀"]}
+    return {"logs": conversation_logs}
 
 @app.post("/start")
 async def start():
+    log_event("🚀 Session started")
     return {"status": "started", "message": "Backend process started ✅"}

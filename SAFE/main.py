@@ -149,3 +149,16 @@ async def stt(file: UploadFile):
         tmpfile_path = tmpfile.name
     text = transcribe_audio(tmpfile_path)
     return {"transcription": text}
+
+# ---------------- Dummy Endpoints (for frontend compatibility) ----------------
+@app.get("/status")
+async def status():
+    return {"status": "ok", "message": "Backend is alive ✅"}
+
+@app.get("/logs")
+async def logs():
+    return {"logs": ["System initialized", "No errors so far 🚀"]}
+
+@app.post("/start")
+async def start():
+    return {"status": "started", "message": "Backend process started ✅"}

@@ -6,3 +6,5 @@ numpy
 pyttsx3
 pandas
 rapidfuzz
+uvicorn
+fastapi

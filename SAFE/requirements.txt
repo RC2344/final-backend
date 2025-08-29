@@ -1,0 +1,8 @@
+google-genai
+python-dotenv
+sounddevice
+soundfile
+numpy
+pyttsx3
+pandas
+rapidfuzz

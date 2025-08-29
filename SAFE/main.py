@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-🎙️ Gemini Voice Assistant (with CSV Q&A + Options Selection)
-Mic → STT (Gemini) → Answer (CSV match or Gemini) → TTS
-- Uses CSV Q&A as knowledge base
-- Gives options if multiple matches, waits for user choice
-- Falls back to Gemini if no match
+🎙️ Gemini Voice Assistant (CSV Q&A + Options Selection)
+Web-safe version: no sounddevice, no pyttsx3
+Frontend handles recording/playback, backend handles:
+- CSV lookup
+- Gemini fallback
+- gTTS for audio response
 """
 
 import os
 import sys
-import queue
-import threading
-from dataclasses import dataclass
-
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
+import re
+import tempfile
 import pandas as pd
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
-import pyttsx3
-import re
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
+from gtts import gTTS
 
 from google import genai
 from google.genai import types
-
 
 # ---------------- ENV + API ----------------
 load_dotenv()
@@ -35,7 +31,6 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-
 # ---------------- Settings ----------------
 SYS_PROMPT_QA = (
     "You are a clear, friendly voice assistant. "
@@ -45,97 +40,45 @@ SYS_PROMPT_QA = (
 )
 
 CSV_FILE = "qa.csv"
-SAMPLE_RATE = 16000
-CHANNELS = 1
 
-
-# ---------------- Recorder ----------------
-@dataclass
-class Recorder:
-    q: queue.Queue = queue.Queue()
-    frames: list = None
-    recording: bool = False
-
-    def __post_init__(self):
-        self.frames = []
-
-    def callback(self, indata, frames, time_, status):
-        if status:
-            print(status, file=sys.stderr)
-        self.q.put(indata.copy())
-
-    def record(self):
-        self.frames.clear()
-        self.recording = True
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=self.callback):
-            while self.recording:
-                try:
-                    self.frames.append(self.q.get(timeout=1))
-                except queue.Empty:
-                    continue
-
-    def stop(self):
-        self.recording = False
-
-    def save_wav(self, filename="recorded.wav"):
-        audio = np.concatenate(self.frames, axis=0)
-        sf.write(filename, audio, SAMPLE_RATE)
-        return filename
-
+# ---------------- FastAPI app ----------------
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------- CSV Loader ----------------
 def load_csv(csv_file):
     if not os.path.exists(csv_file):
-        print(f"⚠️ CSV file {csv_file} not found. Skipping Q&A.")
         return []
     df = pd.read_csv(csv_file)
-    pairs = [(str(q).strip(), str(a).strip()) for q, a in zip(df.iloc[:, 0], df.iloc[:, 1])]
-    print(f"📚 Loaded {len(pairs)} Q&A entries from {csv_file}")
-    return pairs
+    return [(str(q).strip(), str(a).strip()) for q, a in zip(df.iloc[:, 0], df.iloc[:, 1])]
 
+qa_pairs = load_csv(CSV_FILE)
 
-# ---------------- Advanced Fuzzy Match ----------------
+# ---------------- Fuzzy Match ----------------
 def score_match(user_text: str, candidate: str) -> float:
-    """Composite similarity score between user query and candidate."""
-
     tsr = fuzz.token_sort_ratio(user_text, candidate)
     pr = fuzz.partial_ratio(user_text, candidate)
     wr = fuzz.WRatio(user_text, candidate)
-
     len_ratio = min(len(user_text), len(candidate)) / max(len(user_text), len(candidate))
     len_score = 100 * len_ratio
-
-    score = (0.4 * tsr + 0.3 * pr + 0.2 * wr + 0.1 * len_score)
-
-    return score
-
+    return (0.4 * tsr + 0.3 * pr + 0.2 * wr + 0.1 * len_score)
 
 def find_answer_local(user_text: str, qa_pairs: list, top_k: int = 5):
-    """Find closest answers from CSV using composite scoring."""
     user_text = user_text.strip()
     if not user_text:
-        return None, []
-
-    candidates = []
-    for idx, (q, _) in enumerate(qa_pairs):
-        s = score_match(user_text, q)
-        candidates.append((q, s, idx))
-
+        return None
+    candidates = [(q, score_match(user_text, q), idx) for idx, (q, _) in enumerate(qa_pairs)]
     candidates = sorted(candidates, key=lambda x: x[1], reverse=True)[:top_k]
-
-    high, medium = 85, 70
-    if len(user_text.split()) <= 3:
-        high, medium = 90, 80
-
+    if not candidates:
+        return None
     best_q, best_score, best_idx = candidates[0]
-
-    if best_score >= high:
-        return qa_pairs[best_idx][1], []
-    elif best_score >= medium:
-        return None, candidates
-    else:
-        return None, []
-
+    return qa_pairs[best_idx][1] if best_score >= 80 else None
 
 # ---------------- Gemini Wrappers ----------------
 qa_chat = client.chats.create(
@@ -157,13 +100,11 @@ def query_gemini(user_text: str) -> str:
     except Exception as e:
         return f"⚠️ Gemini API error: {e}"
 
-
 def transcribe_audio(file_path: str) -> str:
     try:
         with open(file_path, "rb") as f:
             audio_bytes = f.read()
             part = types.Part(inline_data=types.Blob(mime_type="audio/wav", data=audio_bytes))
-
             resp = client.models.generate_content(
                 model="gemini-1.5-flash",
                 contents=[part],
@@ -175,137 +116,33 @@ def transcribe_audio(file_path: str) -> str:
     except Exception as e:
         return f"⚠️ STT error: {e}"
 
+# ---------------- API Endpoints ----------------
+@app.get("/")
+def root():
+    return {"status": "Voice Assistant Backend is running"}
 
-# ---------------- Short Speech Summary ----------------
-def summarize_for_speech(answer: str) -> str:
-    sentences = re.split(r'(?<=[.!?]) +', answer.strip())
-    if not sentences:
-        return answer
-
-    key_sentences = []
-    for s in sentences:
-        s = s.strip()
-        if len(s) < 20:
-            continue
-        key_sentences.append(s)
-        if len(key_sentences) >= 4:
-            break
-
-    if not key_sentences:
-        key_sentences = sentences[:2]
-
-    bullets = [f"• {s}" for s in key_sentences]
-    return "Here are the main points:\n" + "\n".join(bullets)
-
-
-# ---------------- Speech ----------------
-def speak(tts, text: str):
-    if not text:
-        return
-    try:
-        clean_text = " ".join(text.split())
-        threading.Thread(target=lambda: (tts.say(clean_text), tts.runAndWait())).start()
-    except Exception as e:
-        print(f"🔇 TTS error: {e}")
-
-
-# ---------------- Handle Turn ----------------
-def handle_turn(user_text, tts, qa_pairs, rec):
-    local_answer, candidates = find_answer_local(user_text, qa_pairs)
-
+@app.post("/ask/")
+async def ask(query: str = Form(...)):
+    """Handle text query, return text + speech file"""
+    local_answer = find_answer_local(query, qa_pairs)
     if local_answer:
-        print(f"\n🤖 Full Answer:\n{local_answer}\n")
-        short_reply = summarize_for_speech(local_answer)
-        speak(tts, short_reply)
-        return
+        answer = local_answer
+    else:
+        answer = query_gemini(query)
 
-    if candidates:
-        print("\n🤖 Clarification needed. Possible matches:\n")
-        for i, (q, s, idx) in enumerate(candidates, 1):
-            print(f"{i}. {q}")
+    # Generate speech
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
+        tts = gTTS(answer)
+        tts.save(tmpfile.name)
+        audio_path = tmpfile.name
 
-        clarifying = "I found some similar questions. Please say option number like one, two, or three."
-        print("\n🤖 Spoken clarification:\n", clarifying)
-        speak(tts, clarifying)
+    return {"answer": answer, "audio_file": audio_path}
 
-        # Wait for choice
-        while True:
-            input("Press ENTER and speak your choice...")
-            t = threading.Thread(target=rec.record)
-            t.start()
-            input()
-            rec.stop()
-            t.join()
-            wav_file = rec.save_wav("recorded.wav")
-
-            choice_text = transcribe_audio(wav_file).lower().strip()
-            print(f"📝 Choice STT: {choice_text}")
-
-            match = re.search(r"(option\s*)?(\d+|one|two|three|four|five)", choice_text)
-            if match:
-                val = match.group(2)
-                num_map = {"one":1,"two":2,"three":3,"four":4,"five":5}
-                choice_num = int(num_map.get(val, val))
-
-                if 1 <= choice_num <= len(candidates):
-                    chosen_idx = candidates[choice_num-1][2]
-                    chosen_answer = qa_pairs[chosen_idx][1]
-                    print(f"\n🤖 Selected Answer:\n{chosen_answer}\n")
-                    short_reply = summarize_for_speech(chosen_answer)
-                    speak(tts, short_reply)
-                    return
-
-            speak(tts, "Sorry, I did not understand. Please say option number again.")
-
-        return
-
-    ai_answer = query_gemini(user_text)
-    print(f"\n🤖 Full Answer (Gemini):\n{ai_answer}\n")
-    short_reply = summarize_for_speech(ai_answer)
-    speak(tts, short_reply)
-
-
-# ---------------- Main Loop ----------------
-def main():
-    qa_pairs = load_csv(CSV_FILE)
-
-    tts = pyttsx3.init()
-    tts.setProperty("rate", 165)
-    tts.setProperty("volume", 1.0)
-
-    rec = Recorder()
-
-    print("\n🎙️ Gemini Voice Assistant (CSV + Gemini + Options)")
-    print("Press ENTER to start recording, ENTER again to stop. Type 'q' + ENTER to quit.")
-
-    greeting = "Hello! I am your M C B voice assistant. How can I help you today?"
-    print(f"\n🤖 Greeting:\n{greeting}\n")
-    speak(tts, greeting)
-
-    while True:
-        cmd = input("Press ENTER to record (or 'q' to quit): ")
-        if cmd.strip().lower() == "q":
-            break
-
-        print("🎤 Recording... Press ENTER to stop.")
-        t = threading.Thread(target=rec.record)
-        t.start()
-        input()
-        rec.stop()
-        t.join()
-        print("⏹️ Stopped recording.")
-
-        wav_file = rec.save_wav("recorded.wav")
-
-        print("📝 Transcribing...")
-        user_text = transcribe_audio(wav_file)
-        print(f"📝 STT: {user_text}")
-        if not user_text:
-            continue
-
-        handle_turn(user_text, tts, qa_pairs, rec)
-
-
-# ---------------- Run ----------------
-if __name__ == "__main__":
-    main()
+@app.post("/stt/")
+async def stt(file: UploadFile):
+    """Accept audio file, return transcription"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+        tmpfile.write(await file.read())
+        tmpfile_path = tmpfile.name
+    text = transcribe_audio(tmpfile_path)
+    return {"transcription": text}
